@@ -33,8 +33,8 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
 
-from .logger import logger
-from .settings import settings
+from app.logger import logger
+from app.settings import settings
 
 # -----------------------------------------------------------------------------
 # GLOBALS

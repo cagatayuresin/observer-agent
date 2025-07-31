@@ -95,7 +95,7 @@ After=network.target
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${INSTALL_DIR}/.env
-ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/app/agent.py
+ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/app/agent.py -m app.agent
 Restart=always
 RestartSec=5
 
