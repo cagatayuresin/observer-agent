@@ -1,13 +1,18 @@
-import sys
+"""
+Structured JSON logger for observer-agent.
+"""
+
 import logging
+import sys
+
 from pythonjsonlogger import jsonlogger
 
-formatter = jsonlogger.JsonFormatter(
-    '%(asctime)s %(name)s %(levelname)s %(message)s'
+_formatter = jsonlogger.JsonFormatter(
+    "%(asctime)s %(levelname)s %(name)s %(message)s"
 )
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(formatter)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(_formatter)
 
 logger = logging.getLogger("observer-agent")
-logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+logger.addHandler(_handler)

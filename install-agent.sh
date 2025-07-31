@@ -1,52 +1,94 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1) Parametreleri sor
+#───────────────────────────────────────────────────────────────────────────────
+# 1) Parametreler
+#───────────────────────────────────────────────────────────────────────────────
 DEFAULT_AGENT_ID="$(hostname)"
-read -p "Agent ID [${DEFAULT_AGENT_ID}]: " AGENT_ID
+read -rp "Agent ID [${DEFAULT_AGENT_ID}]: " AGENT_ID
 AGENT_ID="${AGENT_ID:-$DEFAULT_AGENT_ID}"
 
 DEFAULT_RMQ="amqp://guest:guest@rabbitmq:5672/"
-read -p "RabbitMQ URL [${DEFAULT_RMQ}]: " RABBITMQ_URL
+read -rp "RabbitMQ URL [${DEFAULT_RMQ}]: " RABBITMQ_URL
 RABBITMQ_URL="${RABBITMQ_URL:-$DEFAULT_RMQ}"
 
+#───────────────────────────────────────────────────────────────────────────────
 # 2) Dizini oluştur
+#───────────────────────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/observer-agent"
-if [ ! -d "$INSTALL_DIR" ]; then
-  mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+
+#───────────────────────────────────────────────────────────────────────────────
+# 3) Sistem paketleri
+#───────────────────────────────────────────────────────────────────────────────
+apt-get update
+apt-get install -y python3 python3-venv python3-pip git curl
+
+# kubectl (K8s dışı host’ta bile pod metrikleri okunabilsin)
+if ! command -v kubectl &>/dev/null; then
+  curl -L --output /usr/local/bin/kubectl \
+    https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+  chmod +x /usr/local/bin/kubectl
 fi
 
-# 3) Gerekli paketleri yükle
-apt-get update
-apt-get install -y python3 python3-venv python3-pip git
-
-# 4) Kodları çek (varsa güncelle)
-if [ -d "$INSTALL_DIR/.git" ]; then
-  git -C "$INSTALL_DIR" pull
+#───────────────────────────────────────────────────────────────────────────────
+# 4) Kodları çek
+#───────────────────────────────────────────────────────────────────────────────
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+  git -C "$INSTALL_DIR" pull --ff-only
 else
   git clone https://github.com/cagatayuresin/observer-agent.git "$INSTALL_DIR"
 fi
 
-# 5) Python sanal ortam ve bağımlılıklar
+#───────────────────────────────────────────────────────────────────────────────
+# 5) Python venv
+#───────────────────────────────────────────────────────────────────────────────
 cd "$INSTALL_DIR"
 python3 -m venv venv
-. venv/bin/activate
-pip install --upgrade pip
+source venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
 
-# 6) .env dosyasını oluştur
+#───────────────────────────────────────────────────────────────────────────────
+# 6) Kubeconfig otomatik algılama
+#───────────────────────────────────────────────────────────────────────────────
+KUBECONFIG_DEST=""
+for CANDIDATE in \
+  "$HOME/.kube/config" \
+  "/etc/kubernetes/admin.conf" \
+  "/etc/rancher/k3s/k3s.yaml"
+do
+  if [[ -f "$CANDIDATE" ]]; then
+    KUBECONFIG_DEST="$INSTALL_DIR/cluster-admin.conf"
+    cp "$CANDIDATE" "$KUBECONFIG_DEST"
+    chmod 600 "$KUBECONFIG_DEST"
+    echo "✅ Kubeconfig bulundu ve kopyalandı: $CANDIDATE → $KUBECONFIG_DEST"
+    break
+  fi
+done
+
+if [[ -z "$KUBECONFIG_DEST" ]]; then
+  echo "⚠️  Kubernetes kubeconfig bulunamadı. Agent host-only modda çalışacak."
+fi
+
+#───────────────────────────────────────────────────────────────────────────────
+# 7) .env dosyası
+#───────────────────────────────────────────────────────────────────────────────
 cat > .env <<EOF
 RABBITMQ_URL=${RABBITMQ_URL}
 METRICS_QUEUE=metrics
 AGENT_ID=${AGENT_ID}
 INTERVAL=30
+$( [[ -n "$KUBECONFIG_DEST" ]] && echo "KUBECONFIG=${KUBECONFIG_DEST}" )
 EOF
 
-# 7) systemd servisini ayarla
+#───────────────────────────────────────────────────────────────────────────────
+# 8) systemd servisi
+#───────────────────────────────────────────────────────────────────────────────
 SERVICE_FILE="/etc/systemd/system/observer-agent.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Observer Agent Service
+Description=Observer Agent
 After=network.target
 
 [Service]
@@ -61,18 +103,21 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# 8) Servisi başlat
 systemctl daemon-reload
-systemctl enable observer-agent
-systemctl restart observer-agent
+systemctl enable --now observer-agent
 
-echo "Kurulum tamamlandı!"
-echo "Agent ID: $AGENT_ID"
-echo "RabbitMQ URL: $RABBITMQ_URL"
-echo "Servis durumu: $(systemctl is-active observer-agent)"
-echo "Loglar için: journalctl -u observer-agent -f"
-echo "Kurulum dizini: $INSTALL_DIR"
-echo "Observer Agent başarıyla kuruldu ve çalışıyor!"
-echo "Lütfen RabbitMQ ve Observer Agent arayüzlerini kontrol edin."
-echo "Herhangi bir sorunla karşılaşırsanız, lütfen logları kontrol edin."
-echo "Kurulum tamamlandı!"
+#───────────────────────────────────────────────────────────────────────────────
+# 9) Bilgilendirme
+#───────────────────────────────────────────────────────────────────────────────
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Agent kuruldu ve başlatıldı."
+echo "  • Agent ID     : ${AGENT_ID}"
+echo "  • RabbitMQ URL : ${RABBITMQ_URL}"
+if [[ -n "$KUBECONFIG_DEST" ]]; then
+  echo "  • Kubeconfig   : ${KUBECONFIG_DEST}"
+else
+  echo "  • Kubeconfig   : bulunamadı (Kubernetes metrikleri toplanmayacak)"
+fi
+echo "  • Status       : $(systemctl is-active observer-agent)"
+echo "Logları izlemek için: journalctl -u observer-agent -f"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
