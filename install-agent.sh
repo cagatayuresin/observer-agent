@@ -93,9 +93,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=${INSTALL_DIR}/.env
-ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/app/agent.py -m app.agent
+EnvironmentFile=/opt/observer-agent/.env
+Environment=PYTHONPATH=/opt/observer-agent
+ExecStart=${INSTALL_DIR}/venv/bin/python -m app.agent
 Restart=always
 RestartSec=5
 
@@ -103,6 +103,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+sudo rm -f /opt/observer-agent/VERSION
+echo "2.0.0" | sudo tee /opt/observer-agent/VERSION
 systemctl daemon-reload
 systemctl enable --now observer-agent
 

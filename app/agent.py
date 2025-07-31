@@ -1,30 +1,26 @@
 """
-observer-agent  –  rules-aware edition  (v2.0.0)
+observer-agent – rules-aware edition  (v2.1.0)
 
-• Host + pod metriklerini toplamaya devam eder (Influx için).
-• RabbitMQ 'rules' (fan-out) exchange'inden kural setini alır, bellekte tutar.
-• Her döngüde CrashLoopBackOff / OOMKilled vb. olayları kurallarla eşleştirip
-  delete_pod veya scale_deployment gibi aksiyonlar uygular.
-
-Basit, bloklayıcı olmayan tek dosyalık MVP – ileri işlemler (rate-limit, imza,
-retry, vs.) eklenebilir.
+• Host + pod metrikleri (CPU, bellek, disk)
+• Pod bazlı kaynak kullanımı (millicore / byte + %)
+• RabbitMQ üzerinden metrik publish
+• RabbitMQ 'rules' exchange’inden kural seti alır, bellekte tutar
+• CrashLoopBackOff / OOMKilled vb. olayları kurallarla eşleştirip delete_pod /
+  scale_deployment aksiyonlarını uygular
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import signal
 import subprocess
 import time
 from collections import Counter
-from hashlib import md5
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import psutil
-import yaml
 from aio_pika import Message, connect_robust
 from aio_pika.channel import Channel
 from aio_pika.exceptions import AMQPConnectionError
@@ -36,21 +32,19 @@ from kubernetes.client.rest import ApiException
 from app.logger import logger
 from app.settings import settings
 
-# -----------------------------------------------------------------------------
-# GLOBALS
-# -----------------------------------------------------------------------------
-VERSION = Path(__file__).parent.parent.joinpath("VERSION").read_text().strip()
+# ----------------------------------------------------------------------------- #
+VERSION = "2.1.0"
 shutdown_event = asyncio.Event()
 connection: Optional[Connection] = None
 channel: Optional[Channel] = None
 
-# Bellekte kurallar
+# Bellekte tutulan kurallar
 RULES: Dict[str, Any] = {"version": 0, "rules": []}
 health_status = {"status": "starting", "last_successful_publish": None}
 
-# -----------------------------------------------------------------------------
-# K8s yardımcıları
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# Kubernetes yardımcı fonksiyonları                                             #
+# ----------------------------------------------------------------------------- #
 def load_k8s_config():
     try:
         k8s_config.load_incluster_config()
@@ -60,6 +54,81 @@ def load_k8s_config():
 def k8s_core() -> k8s_client.CoreV1Api:
     load_k8s_config()
     return k8s_client.CoreV1Api()
+
+# ----------------------------------------------------------------------------- #
+# Pod resource helpers – kubectl top                                            #
+# ----------------------------------------------------------------------------- #
+_CPU_TOTAL_MILLICORE = psutil.cpu_count(logical=True) * 1000
+_MEM_TOTAL_BYTES = psutil.virtual_memory().total
+
+def _parse_cpu(raw: str) -> int:
+    """'25m'→25,  '2'→2000 (millicore)."""
+    raw = raw.strip().lower()
+    if raw.endswith("m"):
+        return int(raw[:-1])
+    return int(float(raw) * 1000)
+
+def _parse_mem(raw: str) -> int:
+    """'128Mi'→134217728, '1Gi'→1073741824 (byte)."""
+    raw = raw.strip()
+    if raw[-2:].lower() in {"ki", "mi", "gi"}:
+        num = float(raw[:-2])
+        unit = raw[-2:].lower()
+        mult = {"ki": 1024, "mi": 1024**2, "gi": 1024**3}[unit]
+        return int(num * mult)
+    return int(raw)
+
+def get_pod_resource_usage() -> List[Dict[str, Any]]:
+    """
+    Çıktı: kubectl top pod -A --no-headers
+    NAMESPACE  NAME  CPU(cores)  MEMORY(bytes)
+    """
+    try:
+        out = subprocess.check_output(
+            ["kubectl", "top", "pod", "-A", "--no-headers"],
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+
+    usage: List[Dict[str, Any]] = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        ns, name, cpu_raw, mem_raw = parts[:4]
+        cpu_m = _parse_cpu(cpu_raw)
+        mem_b = _parse_mem(mem_raw)
+        cpu_pct = round(cpu_m / _CPU_TOTAL_MILLICORE * 100, 2) if _CPU_TOTAL_MILLICORE else None
+        mem_pct = round(mem_b / _MEM_TOTAL_BYTES * 100, 2) if _MEM_TOTAL_BYTES else None
+        usage.append(
+            {
+                "ns": ns,
+                "pod_name": name,
+                "cpu_millicores": cpu_m,
+                "cpu_percent": cpu_pct,
+                "memory_bytes": mem_b,
+                "memory_percent": mem_pct,
+            }
+        )
+    return usage
+
+# ----------------------------------------------------------------------------- #
+# RULE ENGINE                                                                   #
+# ----------------------------------------------------------------------------- #
+def matches_rule(pod: Dict[str, Any], rule: Dict[str, Any], reason: str) -> bool:
+    m = rule.get("match", {})
+    # namespace eşleşmesi
+    if "namespace" in m and m["namespace"] != pod["ns"]:
+        return False
+    # label eşleşmesi
+    if "labels" in m:
+        pod_labels = pod.get("labels", {})
+        if not all(pod_labels.get(k) == v for k, v in m["labels"].items()):
+            return False
+    # hata nedeni
+    return m.get("reason") == reason
 
 def delete_pod(namespace: str, name: str) -> None:
     try:
@@ -105,55 +174,36 @@ def scale_deployment(namespace: str, deployment: str, replicas: int) -> None:
             },
         )
 
-# -----------------------------------------------------------------------------
-# RULE ENGINE
-# -----------------------------------------------------------------------------
-def matches_rule(pod: Dict[str, Any], rule: Dict[str, Any], reason: str) -> bool:
-    m = rule["match"]
-    # namespace
-    if "namespace" in m and m["namespace"] != pod["ns"]:
-        return False
-    # labels
-    if "labels" in m:
-        pod_labels = {**pod.get("labels", {})}
-        if not all(pod_labels.get(k) == v for k, v in m["labels"].items()):
-            return False
-    # reason
-    return m.get("reason") == reason
-
 def evaluate_pod_events(pods: List[Dict[str, Any]]) -> None:
-    """
-    CrashLoopBackOff / OOMKilled gibi durumları tespit edip RULES'e göre aksiyon uygular.
-    """
+    """CrashLoopBackOff / OOMKilled vb. olayları kurallarla eşleştirir."""
     for pod in pods:
-        reason = pod.get("status_reason")  # CrashLoopBackOff, OOMKilled vs.
+        reason = pod.get("status_reason")
         if not reason:
             continue
         for rule in RULES["rules"]:
             if matches_rule(pod, rule, reason):
-                action = rule["action"]
-                if action["type"] == "delete_pod":
+                action = rule.get("action", {})
+                if action.get("type") == "delete_pod":
                     delete_pod(pod["ns"], pod["name"])
-                elif action["type"] == "scale_deployment":
+                elif action.get("type") == "scale_deployment":
                     scale_deployment(
                         pod["ns"],
-                        action.get("deployment") or pod["owner"],  # owner dep adı
-                        action["replicas"],
+                        action.get("deployment") or pod["owner"],
+                        action.get("replicas", 1),
                     )
 
-# -----------------------------------------------------------------------------
-# METRIC & EVENT GATHERING (kısaltılmış – önceki sürümle aynı mantık + reason)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# METRIC & EVENT GATHERING                                                      #
+# ----------------------------------------------------------------------------- #
 def collect_metrics() -> Optional[Dict[str, Any]]:
     ts = time.time()
 
-    # host metrics (kısa)
-    cpu = psutil.cpu_percent(interval=1)
-    mem = psutil.virtual_memory().percent
-    disk = psutil.disk_usage("/").percent
-    uptime = ts - psutil.boot_time()
+    # host metrics
+    cpu_percent = psutil.cpu_percent(interval=1)
+    mem_percent = psutil.virtual_memory().percent
+    disk_percent = psutil.disk_usage("/").percent
 
-    # k8s pod listesi
+    # kubernetes pod list
     pods, status_counts = [], Counter()
     k8s_available = False
     try:
@@ -164,9 +214,14 @@ def collect_metrics() -> Optional[Dict[str, Any]]:
         js = json.loads(raw)
         for item in js["items"]:
             status = item["status"].get("phase")
-            reason = item["status"].get("reason") or item["status"].get(
-                "containerStatuses", [{}]
-            )[0].get("state", {}).get("waiting", {}).get("reason")
+            reason = (
+                item["status"].get("reason")
+                or item["status"]
+                .get("containerStatuses", [{}])[0]
+                .get("state", {})
+                .get("waiting", {})
+                .get("reason")
+            )
             pods.append(
                 {
                     "ns": item["metadata"]["namespace"],
@@ -174,39 +229,43 @@ def collect_metrics() -> Optional[Dict[str, Any]]:
                     "status_reason": reason,
                     "status": status,
                     "labels": item["metadata"].get("labels", {}),
-                    "owner": item["metadata"]["ownerReferences"][0]["name"]
-                    if item["metadata"].get("ownerReferences")
-                    else "",
+                    "owner": item["metadata"]
+                    .get("ownerReferences", [{}])[0]
+                    .get("name", ""),
                 }
             )
             status_counts[status] += 1
     except Exception:
         pass  # host-only mod
 
-    # rule evaluation:
+    # pod resource metrics
+    pod_resources = get_pod_resource_usage()
+
+    # rule evaluation
     evaluate_pod_events(pods)
 
     return {
         "agent_id": settings.agent_id,
         "timestamp": ts,
-        "cpu_percent": cpu,
-        "memory_percent": mem,
-        "disk_percent": disk,
+        "cpu_percent": cpu_percent,
+        "memory_percent": mem_percent,
+        "disk_percent": disk_percent,
         "kubernetes_available": k8s_available,
         "pod_count": len(pods),
         "pod_status_counts": dict(status_counts),
+        "pod_resources": pod_resources,  # yeni alan
         "health_status": health_status["status"],
     }
 
-# -----------------------------------------------------------------------------
-# RABBITMQ İLETİŞİMİ
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+# RABBITMQ iletişimi                                                            #
+# ----------------------------------------------------------------------------- #
 async def on_rules_message(msg: AbstractIncomingMessage) -> None:
     global RULES
     async with msg.process():
         try:
             payload = json.loads(msg.body.decode())
-            if payload["version"] != RULES["version"]:
+            if payload.get("version") != RULES["version"]:
                 RULES = payload
                 logger.info(
                     "rules update received",
@@ -214,11 +273,11 @@ async def on_rules_message(msg: AbstractIncomingMessage) -> None:
                 )
         except Exception as e:
             logger.error(
-                "rules message error", extra={"agent_id": settings.agent_id, "err": str(e)}
+                "rules message error",
+                extra={"agent_id": settings.agent_id, "err": str(e)},
             )
 
 async def setup_connection() -> bool:
-    """RabbitMQ connection + rules subscription."""
     global connection, channel
     for _ in range(settings.max_retries):
         try:
@@ -226,7 +285,7 @@ async def setup_connection() -> bool:
             channel = await connection.channel()
             await channel.declare_queue(settings.metrics_queue, durable=True)
 
-            # rules fan-out queue
+            # rules fan-out
             exchange = await channel.declare_exchange("rules", "fanout")
             rules_q = await channel.declare_queue(exclusive=True, auto_delete=True)
             await rules_q.bind(exchange)
@@ -240,9 +299,6 @@ async def setup_connection() -> bool:
     health_status["status"] = "connection_failed"
     return False
 
-# -----------------------------------------------------------------------------
-# METRIC PUBLISH (değişmedi – kısaltılmış)
-# -----------------------------------------------------------------------------
 async def publish_metrics(data: Dict[str, Any]) -> bool:
     global channel
     if not channel or channel.is_closed:
@@ -251,7 +307,8 @@ async def publish_metrics(data: Dict[str, Any]) -> bool:
     try:
         body = json.dumps(data, ensure_ascii=False).encode()
         await channel.default_exchange.publish(
-            Message(body, delivery_mode=2), routing_key=settings.metrics_queue
+            Message(body, delivery_mode=2),
+            routing_key=settings.metrics_queue,
         )
         health_status["last_successful_publish"] = time.time()
         return True
@@ -259,9 +316,6 @@ async def publish_metrics(data: Dict[str, Any]) -> bool:
         health_status["status"] = "publish_failed"
         return False
 
-# -----------------------------------------------------------------------------
-# LOOP & SHUTDOWN  (kısaltılmış – önceki sürümle aynı mantık)
-# -----------------------------------------------------------------------------
 async def publish_loop() -> None:
     if not await setup_connection():
         logger.error("cannot connect to RabbitMQ")
@@ -272,6 +326,9 @@ async def publish_loop() -> None:
             await publish_metrics(data)
         await asyncio.sleep(settings.interval)
 
+# ----------------------------------------------------------------------------- #
+# MAIN                                                                          #
+# ----------------------------------------------------------------------------- #
 async def main() -> None:
     signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
     signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())

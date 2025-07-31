@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     max_cpu_threshold: float = 95.0
     max_memory_threshold: float = 95.0
     max_disk_threshold: float = 95.0
+    
+    # Kubernetes settings
+    kubeconfig: str | None = None     
 
 
 settings = Settings()
